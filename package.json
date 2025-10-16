@@ -1,28 +1,15 @@
 {
-  "name": "modlogger",
+  "name": "my-discord-bot",
   "version": "1.0.0",
-  "description": "ModLogger - records mod deletions and VC drags",
   "main": "index.js",
-  "engines": {
-    "node": ">=16.17.0"
-  },
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": "18.x"
+  },
   "dependencies": {
-    "discord.js": "^14.23.2",
-    "dotenv": "^17.2.3",
-    "fs-extra": "^11.3.2"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Amey-AFK/Discord-bot.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/Amey-AFK/Discord-bot/issues"
-  },
-  "homepage": "https://github.com/Amey-AFK/Discord-bot#readme"
+    "discord.js": "^14.11.0"
+  }
 }
+

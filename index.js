@@ -1,11 +1,11 @@
-require('dotenv').config(); // load token from .env
 const { Client, GatewayIntentBits, Partials, AuditLogEvent, EmbedBuilder } = require('discord.js');
 const fs = require('fs-extra');
 const path = require('path');
 
+// Load token from environment variable (Render)
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
-  console.error('Error: DISCORD_TOKEN not set in .env');
+  console.error('Error: DISCORD_TOKEN not set as environment variable');
   process.exit(1);
 }
 
@@ -56,10 +56,6 @@ function isMemberMod(member, guildId) {
   const cfg = ensureGuildConfig(guildId);
   if (!cfg.modRoleIds || cfg.modRoleIds.length === 0) return false;
   return member.roles.cache.some(r => cfg.modRoleIds.includes(r.id));
-}
-
-function ts() {
-  return new Date().toISOString();
 }
 
 // Command handling
