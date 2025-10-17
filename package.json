@@ -1,15 +1,17 @@
 {
-  "name": "my-discord-bot",
-  "version": "1.0.0",
+  "name": "modlogger",
+  "version": "1.1.0",
+  "description": "Discord moderation tracker bot (Render-compatible, no DB).",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": "18.x"
-  },
   "dependencies": {
-    "discord.js": "^14.11.0",
-    "fs-extra": "^11.3.2"
+    "discord.js": "^14.16.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.x"
   }
 }
+
