@@ -1,230 +1,277 @@
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
-const TOKEN = process.env.TOKEN; // stored in Render environment variable
-const PREFIX = '!';
-const cron = require('node-cron'); // for daily midnight task
+// index.js
+
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  AuditLogEvent,
+  PermissionFlagsBits
+} = require("discord.js");
+const cron = require("node-cron");
+
+const TOKEN = process.env.TOKEN;
+const PREFIX = "!";
+
+if (!TOKEN) {
+  console.error("❌ BOT TOKEN not found in environment variables.");
+  process.exit(1);
+}
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMessageReactions
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-let settings = {
-  activityLogChannel: null,
-  vcLogChannel: null,
-  messageLogChannel: null,
-  modRoles: [],
-  reminderEnabled: true,
-  reminderInterval: 30,
-  timeoutDuration: 10
-};
+process.on("unhandledRejection", (err) =>
+  console.error("Unhandled Rejection:", err)
+);
+client.on("error", (err) => console.error("Client Error:", err));
 
-// In-memory cache for current session (won’t persist after restart)
-let modStats = {}; // { guildId: { userId: { daily: n, weekly: n, monthly: n } } }
+// ====== CONFIG STORAGE ======
+const guildConfig = new Map(); // guildId -> { activityLogChannelId, messageLogChannelId, modRoleIds, stats }
 
-function isModerator(member) {
-  return settings.modRoles.some(r => member.roles.cache.has(r));
+// ====== HELPERS ======
+function isMod(member, config) {
+  if (!config?.modRoleIds?.length) return false;
+  return config.modRoleIds.some((r) => member.roles.cache.has(r));
 }
 
-function updateStats(guildId, userId) {
-  if (!modStats[guildId]) modStats[guildId] = {};
-  if (!modStats[guildId][userId]) modStats[guildId][userId] = { daily: 0, weekly: 0, monthly: 0 };
-  modStats[guildId][userId].daily++;
-  modStats[guildId][userId].weekly++;
-  modStats[guildId][userId].monthly++;
+function getChannel(guild, id) {
+  return guild.channels.cache.get(id) || null;
 }
 
-function resetDailyStats() {
-  for (const g in modStats) {
-    for (const u in modStats[g]) modStats[g][u].daily = 0;
+function formatDuration(ms) {
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${h}h ${m}m ${s}s`;
+}
+
+// ====== ACTIVITY SYSTEM ======
+const activeMods = new Map(); // guildId -> Map(userId -> { since })
+
+async function markModIn(member, config) {
+  if (!activeMods.has(member.guild.id)) activeMods.set(member.guild.id, new Map());
+  const mods = activeMods.get(member.guild.id);
+  if (!mods.has(member.id)) {
+    mods.set(member.id, { since: Date.now() });
+    const ch = getChannel(member.guild, config.activityLogChannelId);
+    if (ch) ch.send(`🟢 <@${member.id}> is now **ON DUTY**.`);
   }
 }
 
-function resetWeeklyStats() {
-  for (const g in modStats) {
-    for (const u in modStats[g]) modStats[g][u].weekly = 0;
-  }
+async function markModOut(member, config, auto = false) {
+  const mods = activeMods.get(member.guild.id);
+  if (!mods || !mods.has(member.id)) return;
+  const data = mods.get(member.id);
+  mods.delete(member.id);
+
+  config.stats = config.stats || {};
+  if (!config.stats[member.id]) config.stats[member.id] = { daily: 0, weekly: 0, monthly: 0 };
+  const session = Date.now() - data.since;
+  config.stats[member.id].daily += session;
+  config.stats[member.id].weekly += session;
+  config.stats[member.id].monthly += session;
+
+  const ch = getChannel(member.guild, config.activityLogChannelId);
+  if (ch)
+    ch.send(`🔴 <@${member.id}> is now **OFF DUTY**${auto ? " (timed out)" : ""}.`);
 }
 
-function resetMonthlyStats() {
-  for (const g in modStats) {
-    for (const u in modStats[g]) modStats[g][u].monthly = 0;
-  }
-}
+// ====== REMINDER SYSTEM ======
+let remindersEnabled = true;
+let reminderInterval = 30 * 60 * 1000; // 30 min default
 
-client.once('ready', () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+function startReminders() {
+  setInterval(async () => {
+    if (!remindersEnabled) return;
 
-  // 🕛 Schedule a job to post daily stats at midnight (server time)
-  cron.schedule('0 0 * * *', async () => {
-    for (const [guildId, data] of Object.entries(modStats)) {
+    for (const [guildId, mods] of activeMods.entries()) {
       const guild = client.guilds.cache.get(guildId);
       if (!guild) continue;
-      const logChannel = guild.channels.cache.get(settings.activityLogChannel);
-      if (!logChannel) continue;
+      const config = guildConfig.get(guildId);
+      const ch = getChannel(guild, config?.activityLogChannelId);
+      if (!ch) continue;
 
-      let dailyReport = `📊 **Daily Moderator Activity Report** (as of ${new Date().toLocaleDateString()})\n`;
-      const guildData = modStats[guildId];
-      const members = await guild.members.fetch();
+      for (const [modId, info] of mods.entries()) {
+        const mod = await guild.members.fetch(modId).catch(() => null);
+        if (!mod) continue;
 
-      for (const [userId, stats] of Object.entries(guildData)) {
-        const user = members.get(userId);
-        if (user) dailyReport += `👤 ${user.user.tag} — ${stats.daily} activity points\n`;
+        const reminderMsg = await ch.send(
+          `🔔 Hey <@${modId}>, are you still active? React with ✅ within 2 minutes to stay active.`
+        );
+        await reminderMsg.react("✅");
+
+        const collector = reminderMsg.createReactionCollector({
+          filter: (r, u) => r.emoji.name === "✅" && u.id === modId,
+          time: 120000
+        });
+
+        collector.on("collect", () => {
+          reminderMsg.reply(`✅ <@${modId}> confirmed active.`);
+          collector.stop("confirmed");
+        });
+
+        collector.on("end", async (collected, reason) => {
+          if (reason !== "confirmed") {
+            await markModOut(mod, config, true);
+          }
+        });
       }
-
-      await logChannel.send(dailyReport || "No activity recorded today.");
     }
+  }, reminderInterval);
+}
 
-    resetDailyStats();
+// ====== DAILY REPORT ======
+function scheduleDailyReports() {
+  cron.schedule("0 0 * * *", async () => {
+    for (const [guildId, config] of guildConfig.entries()) {
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) continue;
+      const ch = getChannel(guild, config.activityLogChannelId);
+      if (!ch || !config.stats) continue;
+
+      let msg = `📊 **Daily Mod Stats for ${new Date().toLocaleDateString()}**\n`;
+      for (const [uid, rec] of Object.entries(config.stats)) {
+        msg += `• <@${uid}> — ${formatDuration(rec.daily)}\n`;
+        rec.daily = 0;
+      }
+      await ch.send(msg);
+    }
   });
-});
+}
 
-// 🧾 Commands
-client.on('messageCreate', async message => {
-  if (!message.content.startsWith(PREFIX) || message.author.bot) return;
-  const [cmd, ...args] = message.content.slice(PREFIX.length).trim().split(/\s+/);
-  const member = message.member;
-  const guildId = message.guild.id;
+// ====== MESSAGE DELETE LOGGER ======
+client.on("messageDelete", async (message) => {
+  if (!message.guild || !message.author) return;
+  if (message.author.bot) return;
 
-  // ===== SETUP COMMANDS =====
-  if (cmd === 'set-activity-log') {
-    const ch = message.mentions.channels.first();
-    if (!ch) return message.reply('Mention a valid channel.');
-    settings.activityLogChannel = ch.id;
-    return message.reply(`✅ Activity log set to ${ch}`);
-  }
+  const config = guildConfig.get(message.guild.id);
+  if (!config?.messageLogChannelId) return;
+  const logCh = getChannel(message.guild, config.messageLogChannelId);
+  if (!logCh) return;
 
-  if (cmd === 'set-vc-log') {
-    const ch = message.mentions.channels.first();
-    if (!ch) return message.reply('Mention a valid channel.');
-    settings.vcLogChannel = ch.id;
-    return message.reply(`✅ VC log set to ${ch}`);
-  }
+  try {
+    const logs = await message.guild.fetchAuditLogs({
+      type: AuditLogEvent.MessageDelete,
+      limit: 1
+    });
+    const entry = logs.entries.first();
+    if (!entry) return;
 
-  if (cmd === 'set-message-log') {
-    const ch = message.mentions.channels.first();
-    if (!ch) return message.reply('Mention a valid channel.');
-    settings.messageLogChannel = ch.id;
-    return message.reply(`✅ Message log set to ${ch}`);
-  }
+    const { executor, target } = entry;
+    if (!executor || executor.bot) return;
+    if (target.id !== message.author.id) return; // ensure correct target
+    if (!isMod(await message.guild.members.fetch(executor.id), config)) return;
 
-  if (cmd === 'set-mod-roles') {
-    const roles = message.mentions.roles.map(r => r.id);
-    if (!roles.length) return message.reply('Mention at least one mod role.');
-    settings.modRoles = roles;
-    return message.reply('✅ Mod roles set.');
-  }
+    const embed = new EmbedBuilder()
+      .setTitle("🗑️ Message Deleted by Moderator")
+      .addFields(
+        { name: "Moderator", value: `${executor.tag} (<@${executor.id}>)`, inline: true },
+        { name: "Original Author", value: `${message.author.tag} (<@${message.author.id}>)`, inline: true },
+        { name: "Channel", value: `<#${message.channelId}>`, inline: true },
+        { name: "Content", value: message.content || "_(No content)_" }
+      )
+      .setColor("Red")
+      .setTimestamp();
 
-  // ===== MOD ACTIVITY =====
-  if (cmd === 'in') {
-    if (!isModerator(member)) return message.reply('You are not a moderator.');
-    const ch = message.guild.channels.cache.get(settings.activityLogChannel);
-    if (!ch) return message.reply('Activity log not set.');
-    updateStats(guildId, member.id);
-    await ch.send(`🟢 ${member.user.tag} is now **active**.`);
-  }
-
-  if (cmd === 'out') {
-    if (!isModerator(member)) return message.reply('You are not a moderator.');
-    const ch = message.guild.channels.cache.get(settings.activityLogChannel);
-    if (!ch) return message.reply('Activity log not set.');
-    await ch.send(`🔴 ${member.user.tag} is now **inactive**.`);
-  }
-
-  if (cmd === 'daily') {
-    const guildData = modStats[guildId] || {};
-    if (!Object.keys(guildData).length) return message.reply('No data for today.');
-    let msg = `📅 **Daily Stats (${new Date().toLocaleDateString()})**\n`;
-    for (const [id, st] of Object.entries(guildData)) {
-      const user = await message.guild.members.fetch(id).catch(() => null);
-      if (user) msg += `👤 ${user.user.tag} — ${st.daily} activity\n`;
-    }
-    message.channel.send(msg);
-  }
-
-  if (cmd === 'weekly') {
-    const guildData = modStats[guildId] || {};
-    if (!Object.keys(guildData).length) return message.reply('No weekly data.');
-    let msg = `📊 **Weekly Stats (Last 7 Days)**\n`;
-    for (const [id, st] of Object.entries(guildData)) {
-      const user = await message.guild.members.fetch(id).catch(() => null);
-      if (user) msg += `👤 ${user.user.tag} — ${st.weekly} activity\n`;
-    }
-    message.channel.send(msg);
-  }
-
-  if (cmd === 'monthly') {
-    const guildData = modStats[guildId] || {};
-    if (!Object.keys(guildData).length) return message.reply('No monthly data.');
-    let msg = `📆 **Monthly Stats (Last 30 Days)**\n`;
-    for (const [id, st] of Object.entries(guildData)) {
-      const user = await message.guild.members.fetch(id).catch(() => null);
-      if (user) msg += `👤 ${user.user.tag} — ${st.monthly} activity\n`;
-    }
-    message.channel.send(msg);
-  }
-
-  if (cmd === 'help') {
-    return message.reply(`**📘 ModLogger Help**
-__Mod Tracking__
-!in — Mark yourself active
-!out — Mark yourself inactive
-!daily / !weekly / !monthly — View mod stats
-!set-activity-log #channel — Set log channel
-
-__VC Logs__
-!set-vc-log #channel — Set VC log channel
-!set-mod-roles @role — Define mod roles
-
-__Message Logs__
-!set-message-log #channel — Set message log channel`);
+    await logCh.send({ embeds: [embed] });
+  } catch (err) {
+    console.error("Error logging deleted message:", err);
   }
 });
 
-// Deleted Message Logger
-client.on('messageDelete', async msg => {
-  if (!msg.guild || msg.author?.bot) return;
-  const ch = msg.guild.channels.cache.get(settings.messageLogChannel);
-  if (!ch) return;
-  const logs = await msg.guild.fetchAuditLogs({ type: 72, limit: 1 });
-  const entry = logs.entries.first();
-  if (!entry) return;
-  const { executor } = entry;
-  const mod = await msg.guild.members.fetch(executor.id).catch(() => null);
-  if (mod && isModerator(mod)) {
-    ch.send(`🗑️ **Message Deleted**
-**By:** ${executor.tag}
-**Author:** ${msg.author?.tag || 'Unknown'}
-**Channel:** ${msg.channel}
-**Content:** ${msg.content || 'No text'}`);
+// ====== COMMANDS ======
+client.on("messageCreate", async (msg) => {
+  if (!msg.guild || msg.author.bot) return;
+  if (!msg.content.startsWith(PREFIX)) return;
+
+  const args = msg.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = args.shift()?.toLowerCase();
+  const config = guildConfig.get(msg.guild.id) || {};
+
+  switch (cmd) {
+    case "set-activity-log": {
+      if (!msg.member.permissions.has(PermissionFlagsBits.ManageGuild))
+        return msg.reply("You need **Manage Server** permission.");
+      const ch = msg.mentions.channels.first();
+      if (!ch) return msg.reply("Please mention a channel.");
+      config.activityLogChannelId = ch.id;
+      guildConfig.set(msg.guild.id, config);
+      return msg.reply(`✅ Activity log channel set to ${ch}`);
+    }
+
+    case "set-message-log": {
+      if (!msg.member.permissions.has(PermissionFlagsBits.ManageGuild))
+        return msg.reply("You need **Manage Server** permission.");
+      const ch = msg.mentions.channels.first();
+      if (!ch) return msg.reply("Please mention a channel.");
+      config.messageLogChannelId = ch.id;
+      guildConfig.set(msg.guild.id, config);
+      return msg.reply(`✅ Message log channel set to ${ch}`);
+    }
+
+    case "set-mod-roles": {
+      if (!msg.member.permissions.has(PermissionFlagsBits.ManageGuild))
+        return msg.reply("You need **Manage Server** permission.");
+      const roles = msg.mentions.roles.map((r) => r.id);
+      if (!roles.length) return msg.reply("Mention one or more mod roles.");
+      config.modRoleIds = roles;
+      guildConfig.set(msg.guild.id, config);
+      return msg.reply(`✅ Moderator roles set.`);
+    }
+
+    case "in": {
+      if (!isMod(msg.member, config)) return msg.reply("❌ You are not a moderator.");
+      guildConfig.set(msg.guild.id, config);
+      await markModIn(msg.member, config);
+      return msg.reply("You are now **ON DUTY**.");
+    }
+
+    case "out": {
+      if (!isMod(msg.member, config)) return msg.reply("❌ You are not a moderator.");
+      await markModOut(msg.member, config);
+      return msg.reply("You are now **OFF DUTY**.");
+    }
+
+    case "daily":
+    case "weekly":
+    case "monthly": {
+      if (!config.stats) return msg.reply("No stats yet.");
+      const type = cmd;
+      let reply = `📆 **${type.charAt(0).toUpperCase() + type.slice(1)} Stats**\n`;
+      for (const [uid, rec] of Object.entries(config.stats)) {
+        const time = rec[type] || 0;
+        reply += `• <@${uid}> — ${formatDuration(time)}\n`;
+      }
+      return msg.reply(reply);
+    }
+
+    case "help": {
+      return msg.reply(
+        `**🛠️ ModLogger Commands**\n\n` +
+          `**Activity:** !in, !out, !daily, !weekly, !monthly\n` +
+          `**Setup:** !set-activity-log #ch, !set-message-log #ch, !set-mod-roles @role\n` +
+          `**Other:** !help`
+      );
+    }
   }
 });
 
-// VC Move Logger
-client.on('voiceStateUpdate', async (oldS, newS) => {
-  if (!oldS.channelId || !newS.channelId || oldS.channelId === newS.channelId) return;
-  const ch = newS.guild.channels.cache.get(settings.vcLogChannel);
-  if (!ch) return;
-  const logs = await newS.guild.fetchAuditLogs({ type: 26, limit: 1 });
-  const entry = logs.entries.first();
-  if (!entry) return;
-  const { executor, target } = entry;
-  const mod = await newS.guild.members.fetch(executor.id).catch(() => null);
-  if (mod && isModerator(mod)) {
-    ch.send(`🎧 **VC Move**
-**Moderator:** ${mod.user.tag}
-**User:** ${target.tag}
-**From:** ${oldS.channel?.name}
-**To:** ${newS.channel?.name}`);
-  }
+// ====== READY ======
+client.once("ready", () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  scheduleDailyReports();
+  startReminders();
 });
 
 client.login(TOKEN);
-
-
 
